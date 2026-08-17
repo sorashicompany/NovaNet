@@ -1,0 +1,116 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/novanet"
+PROFILES="$CONFIG_DIR/profiles"
+mkdir -p "$PROFILES"
+
+engine="${NOVANET_ENGINE:-novanet-engine}"
+
+usage() {
+  cat <<'EOF'
+NovaNet Termux
+
+Commands:
+  profile import <wdtt://...|qwdtt://...|json>   Import profile
+  profile list                                   List profiles
+  profile remove <name>                          Remove profile
+  connect --profile <name> [engine flags...]    Start tunnel
+  ping --profile <name>                          Ping peer
+  check --profile <name>                         Check VK hashes
+  subscription sync [URL]                        Download JSON subscription
+EOF
+}
+
+profile_file() { printf '%s/%s.json' "$PROFILES" "$1"; }
+
+import_profile() {
+  local raw="${1:-}"
+  [ -n "$raw" ] || { echo 'profile value required'; exit 2; }
+  local name peer hashes workers port pass
+  if [[ "$raw" == wdtt://* ]]; then
+    IFS=':' read -r _ _ peer dtls wg localp pass hashes <<<"${raw#wdtt://}"
+    # Keep the URI itself as source of truth; parse the standard 6 fields robustly in Python below.
+    python - "$raw" "$PROFILES" <<'PY'
+import json, os, sys, urllib.parse
+raw, root = sys.argv[1], sys.argv[2]
+if raw.startswith('wdtt://'):
+    p=raw[len('wdtt://'):].split(':')
+    if len(p)<6: raise SystemExit('invalid wdtt:// profile')
+    obj={'name': 'NovaNet-'+p[0].replace('.','-'), 'peer': p[0]+':'+p[1], 'port': int(p[3] or 9000), 'password': p[4], 'hashes': ':'.join(p[5:]), 'workers':16, 'source':raw}
+else:
+    u=urllib.parse.urlparse(raw)
+    q=urllib.parse.parse_qs(u.query)
+    obj={'name':q.get('name',['NovaNet'])[0], 'peer':q.get('peer',[''])[0], 'port':int(q.get('port',['9000'])[0]), 'password':q.get('pass',[''])[0], 'hashes':q.get('hashes',[''])[0], 'workers':int(q.get('workers',['16'])[0]), 'source':raw}
+if not obj['peer'] or not obj['password'] or not obj['hashes']: raise SystemExit('peer/password/hashes are required')
+name=''.join(c if c.isalnum() or c in '._-' else '_' for c in obj['name']).strip('_') or 'profile'
+obj['name']=name
+os.makedirs(root,exist_ok=True)
+with open(os.path.join(root,name+'.json'),'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2)
+print(name)
+PY
+  else
+    python - "$raw" "$PROFILES" <<'PY'
+import json, os, sys
+raw, root=sys.argv[1],sys.argv[2]
+obj=json.loads(raw)
+name=obj.get('name','NovaNet')
+name=''.join(c if c.isalnum() or c in '._-' else '_' for c in name).strip('_') or 'profile'
+obj['name']=name
+with open(os.path.join(root,name+'.json'),'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2)
+print(name)
+PY
+  fi
+}
+
+get_profile() {
+  python - "$PROFILES/$(basename "$1").json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+print(p['peer'], p['hashes'], p.get('workers',16), p.get('port',9000), p['password'])
+PY
+}
+
+case "${1:-}" in
+  profile)
+    case "${2:-}" in
+      import) import_profile "${3:-}" ;;
+      list) ls "$PROFILES"/*.json 2>/dev/null | sed 's#.*/##;s#\.json$##' || true ;;
+      remove) rm -f "$(profile_file "${3:-}")" ;;
+      *) usage; exit 2;;
+    esac
+    ;;
+  connect|ping|check)
+    [ -n "${3:-}" ] || true
+    profile=""
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --profile) profile="$2"; shift 2;;
+        *) break;;
+      esac
+    done
+    [ -n "$profile" ] || { echo '--profile is required'; exit 2; }
+    read -r peer hashes workers port pass < <(get_profile "$profile")
+    case "$0" in *connect*) mode="vpn";; *ping*) mode="ping";; *check*) mode="check";; esac
+    if [ "$mode" = ping ]; then exec "$engine" -peer "$peer" -vk "$hashes" -password "$pass" -ping-only; fi
+    if [ "$mode" = check ]; then exec "$engine" -vk "$hashes" -check-hashes; fi
+    exec "$engine" -peer "$peer" -vk "$hashes" -password "$pass" -listen "127.0.0.1:$port" -n "$workers" "$@"
+    ;;
+  subscription)
+    [ "${2:-}" = sync ] || { usage; exit 2; }
+    url="${3:-${NOVANET_SUBSCRIPTION_URL:-}}"
+    [ -n "$url" ] || { echo 'subscription URL required'; exit 2; }
+    curl -fsSL "$url" -o "$PROFILES/subscription.json"
+    python - "$PROFILES/subscription.json" "$PROFILES" <<'PY'
+import json,sys,os
+src=json.load(open(sys.argv[1])); profiles=src.get('profiles',src.get('servers',[]))
+for p in profiles:
+  n=''.join(c if c.isalnum() or c in '._-' else '_' for c in p.get('name','server')).strip('_') or 'server'
+  p['name']=n
+  json.dump(p,open(os.path.join(sys.argv[2],n+'.json'),'w'),ensure_ascii=False,indent=2)
+print('synced',len(profiles),'profiles')
+PY
+    ;;
+  *) usage; exit 2;;
+esac

@@ -1,0 +1,20 @@
+[Unit]
+Description=NovaNet Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/novanet-server
+Restart=always
+RestartSec=5
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/log /run
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

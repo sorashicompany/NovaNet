@@ -10,64 +10,106 @@ NovaNet Termux
   profile import <wdtt://...|qwdtt://...|json>
   profile list
   profile remove <name>
-  connect --profile <name> [engine flags...]
+  connect --profile <name> [--mode socks|vpn|rawtun] [--listen ADDR]
   ping --profile <name>
   check --profile <name>
   subscription sync [URL]
 EOF
 }
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing $1. Install with: pkg install $2" >&2; exit 1; }; }
 profile_file(){ printf '%s/%s.json' "$PROFILES" "$1"; }
+valid_name(){ [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 import_profile(){
   local raw="${1:-}"; [ -n "$raw" ] || { echo 'profile value required'; exit 2; }
+  require_cmd python python
   python - "$raw" "$PROFILES" <<'PY'
-import json, os, sys, urllib.parse
+import json, os, sys, urllib.parse, tempfile
 raw, root = sys.argv[1], sys.argv[2]
 if raw.startswith('wdtt://'):
     p=raw[len('wdtt://'):].split(':')
-    if len(p)<6: raise SystemExit('invalid wdtt:// profile')
-    obj={'name':'NovaNet-'+p[0].replace('.','-'),'peer':p[0]+':'+p[1],'port':int(p[3] or 9000),'password':p[4],'hashes':':'.join(p[5:]),'workers':16,'source':raw}
+    if len(p)<6: raise SystemExit('invalid wdtt:// profile: expected host:port:...:password:hashes')
+    obj={'name':'NovaNet-'+p[0].replace('.','-'),'peer':p[0]+':'+p[1],'port':9000,'password':p[-2],'hashes':':'.join(p[-1:]),'workers':16,'source':raw}
 elif raw.startswith('qwdtt://'):
     u=urllib.parse.urlparse(raw); q=urllib.parse.parse_qs(u.query)
     obj={'name':q.get('name',['NovaNet'])[0],'peer':q.get('peer',[''])[0],'port':int(q.get('port',['9000'])[0]),'password':q.get('pass',[''])[0],'hashes':q.get('hashes',[''])[0],'workers':int(q.get('workers',['16'])[0]),'source':raw}
 else: obj=json.loads(raw)
 if not obj.get('peer') or not obj.get('password') or not obj.get('hashes'): raise SystemExit('peer/password/hashes are required')
 name=''.join(c if c.isalnum() or c in '._-' else '_' for c in obj.get('name','profile')).strip('_') or 'profile'
-obj['name']=name; os.makedirs(root,exist_ok=True)
-with open(os.path.join(root,name+'.json'),'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2)
+obj['name']=name
+os.makedirs(root,exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix='.profile-',suffix='.tmp',dir=root); os.close(fd)
+try:
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2); f.write('\n')
+    os.chmod(tmp,0o600); os.replace(tmp,os.path.join(root,name+'.json'))
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
 print(name)
 PY
 }
-get_profile(){ python - "$PROFILES/$(basename "$1").json" <<'PY'
+get_profile(){
+  local file; file="$(profile_file "$1")"; [ -f "$file" ] || { echo "profile not found: $1" >&2; exit 2; }
+  require_cmd python python
+  python - "$file" <<'PY'
 import json,sys
-p=json.load(open(sys.argv[1])); print(p['peer'],p['hashes'],p.get('workers',16),p.get('port',9000),p['password'])
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+for k in ('peer','hashes','password'):
+    if not p.get(k): raise SystemExit('profile missing '+k)
+print(p['peer'],p['hashes'],int(p.get('workers',16)),int(p.get('port',9000)),p['password'])
 PY
 }
 case "${1:-}" in
 profile)
   case "${2:-}" in
     import) import_profile "${3:-}";;
-    list) ls "$PROFILES"/*.json 2>/dev/null | sed 's#.*/##;s#\.json$##' || true;;
-    remove) rm -f "$(profile_file "${3:-}")";;
+    list) find "$PROFILES" -maxdepth 1 -type f -name '*.json' ! -name subscription.json -printf '%f\n' 2>/dev/null | sed 's/\.json$//' | sort || true;;
+    remove) [ -n "${3:-}" ] && valid_name "$3" || { echo 'invalid profile name'; exit 2; }; rm -f "$(profile_file "$3")";;
     *) usage; exit 2;;
   esac;;
 connect|ping|check)
-  action="$1"; shift; profile=""
-  while [ $# -gt 0 ]; do case "$1" in --profile) profile="$2"; shift 2;; *) break;; esac; done
+  action="$1"; shift; profile=""; mode="socks"; listen="127.0.0.1:1080"; extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) [ $# -ge 2 ] || exit 2; profile="$2"; shift 2;;
+      --mode) [ $# -ge 2 ] || exit 2; mode="$2"; shift 2;;
+      --listen) [ $# -ge 2 ] || exit 2; listen="$2"; shift 2;;
+      --) shift; extra+=("$@"); break;;
+      *) extra+=("$1"); shift;;
+    esac
+  done
   [ -n "$profile" ] || { echo '--profile is required'; exit 2; }
+  command -v "$engine" >/dev/null 2>&1 || { echo "Engine not found: $engine. Run install-termux.sh" >&2; exit 1; }
   read -r peer hashes workers port pass < <(get_profile "$profile")
-  if [ "$action" = ping ]; then exec "$engine" -peer "$peer" -vk "$hashes" -password "$pass" -ping-only; fi
-  if [ "$action" = check ]; then exec "$engine" -vk "$hashes" -check-hashes; fi
-  exec "$engine" -peer "$peer" -vk "$hashes" -password "$pass" -listen "127.0.0.1:$port" -n "$workers" "$@";;
+  case "$action" in
+    ping) exec "$engine" -peer "$peer" -vk "$hashes" -password "$pass" -ping-only "${extra[@]}";;
+    check) exec "$engine" -vk "$hashes" -check-hashes "${extra[@]}";;
+    connect)
+      case "$mode" in socks) exec "$engine" -mode socks -socks "$listen" -peer "$peer" -vk "$hashes" -password "$pass" -n "$workers" "${extra[@]}";;
+        vpn) exec "$engine" -mode vpn -listen "$listen" -peer "$peer" -vk "$hashes" -password "$pass" -n "$workers" "${extra[@]}";;
+        rawtun) exec "$engine" -mode rawtun -listen "$listen" -peer "$peer" -vk "$hashes" -password "$pass" -n "$workers" "${extra[@]}";;
+        *) echo 'mode must be socks, vpn or rawtun'; exit 2;; esac;;
+  esac;;
 subscription)
   [ "${2:-}" = sync ] || { usage; exit 2; }
+  require_cmd curl curl; require_cmd python python
   url="${3:-${NOVANET_SUBSCRIPTION_URL:-}}"; [ -n "$url" ] || { echo 'subscription URL required'; exit 2; }
-  curl -fsSL "$url" -o "$PROFILES/subscription.json"
-  python - "$PROFILES/subscription.json" "$PROFILES" <<'PY'
-import json,sys,os
-src=json.load(open(sys.argv[1])); profiles=src.get('profiles',src.get('servers',[]))
+  tmp="$PROFILES/.subscription.$$.tmp"
+  trap 'rm -f "$tmp"' EXIT
+  curl --fail --silent --show-error --location --connect-timeout 10 --max-time 45 --retry 3 --retry-delay 2 --retry-all-errors "$url" -o "$tmp"
+  python - "$tmp" "$PROFILES" <<'PY'
+import json,sys,os,tempfile
+src=json.load(open(sys.argv[1],encoding='utf-8')); profiles=src.get('profiles',src.get('servers',[]))
+if not isinstance(profiles,list): raise SystemExit('invalid subscription: profiles must be a list')
+root=sys.argv[2]; names=set()
 for p in profiles:
- n=''.join(c if c.isalnum() or c in '._-' else '_' for c in p.get('name','server')).strip('_') or 'server'; p['name']=n
- json.dump(p,open(os.path.join(sys.argv[2],n+'.json'),'w'),ensure_ascii=False,indent=2)
+ n=''.join(c if c.isalnum() or c in '._-' else '_' for c in p.get('name','server')).strip('_') or 'server'
+ if n in names: n += '-'+str(len(names)+1)
+ names.add(n); p=dict(p); p['name']=n
+ fd,tmp=tempfile.mkstemp(prefix='.sync-',suffix='.json',dir=root); os.close(fd)
+ try:
+  with open(tmp,'w',encoding='utf-8') as f: json.dump(p,f,ensure_ascii=False,indent=2); f.write('\n')
+  os.chmod(tmp,0o600); os.replace(tmp,os.path.join(root,n+'.json'))
+ finally:
+  if os.path.exists(tmp): os.unlink(tmp)
 print('synced',len(profiles),'profiles')
 PY
   ;;

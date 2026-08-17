@@ -1,0 +1,75 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -u
+
+# NovaNet connection supervisor for Termux.
+# It deliberately restarts the engine only after it exits; it does not keep
+# multiple copies alive. Temporary failures use exponential backoff.
+engine="${NOVANET_ENGINE:-novanet-engine}"
+mode="socks"
+listen="127.0.0.1:1080"
+peer=""
+password=""
+hashes=""
+workers="9"
+extra=()
+
+usage(){ echo "usage: novanet-watchdog --mode socks|vpn|rawtun --listen ADDR --peer HOST:PORT --password PASS --hashes HASHES --workers N [-- extra-engine-args]"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) mode="$2"; shift 2;;
+    --listen) listen="$2"; shift 2;;
+    --peer) peer="$2"; shift 2;;
+    --password) password="$2"; shift 2;;
+    --hashes) hashes="$2"; shift 2;;
+    --workers) workers="$2"; shift 2;;
+    --) shift; extra+=("$@"); break;;
+    *) echo "unknown watchdog option: $1" >&2; exit 2;;
+  esac
+done
+[ -n "$peer" ] && [ -n "$password" ] && [ -n "$hashes" ] || { usage >&2; exit 2; }
+command -v "$engine" >/dev/null 2>&1 || { echo "Engine not found: $engine" >&2; exit 1; }
+
+# Accept comma/space separated VK hashes. Each restart rotates the first
+# candidate, which helps when one credential is temporarily rate-limited.
+hash_list=()
+oldIFS="$IFS"; IFS=', '
+read -r -a hash_list <<< "$hashes"
+IFS="$oldIFS"
+[ "${#hash_list[@]}" -gt 0 ] || hash_list=("$hashes")
+
+base_args=()
+case "$mode" in
+  socks) base_args=(-mode socks -socks "$listen");;
+  vpn) base_args=(-mode vpn -listen "$listen");;
+  rawtun) base_args=(-mode rawtun -listen "$listen");;
+  *) echo "mode must be socks, vpn or rawtun" >&2; exit 2;;
+esac
+
+attempt=0
+hash_index=0
+while :; do
+  h="${hash_list[$hash_index]}"
+  args=("${base_args[@]}" -peer "$peer" -vk "$h" -password "$password" -n "$workers")
+  # First two attempts use the normal transport. Then force TURN/TCP as a
+  # mobile-network fallback unless the caller already requested it.
+  if [ "$attempt" -ge 2 ]; then
+    has_tcp=0
+    for x in "${extra[@]}"; do [ "$x" = "-turn-tcp" ] && has_tcp=1; done
+    [ "$has_tcp" -eq 1 ] || args+=(-turn-tcp)
+  fi
+  echo "[NovaNet] starting mode=$mode peer=$peer hash=$((hash_index+1))/${#hash_list[@]} attempt=$attempt${attempt:+}"
+  "$engine" "${args[@]}" "${extra[@]}"
+  rc=$?
+  echo "[NovaNet] engine exited rc=$rc" >&2
+
+  # A clean exit is treated as intentional and is not immediately respawned.
+  [ "$rc" -eq 0 ] && exit 0
+
+  hash_index=$(( (hash_index + 1) % ${#hash_list[@]} ))
+  attempt=$((attempt + 1))
+  # 2,4,8,...,60 seconds. Reset after a successful-ish long cycle.
+  delay=$((2 ** (attempt < 6 ? attempt : 5)))
+  [ "$delay" -le 60 ] || delay=60
+  echo "[NovaNet] reconnecting in ${delay}s (hash rotation + TCP fallback)" >&2
+  sleep "$delay"
+done

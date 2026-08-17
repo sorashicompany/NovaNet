@@ -4,7 +4,7 @@ Termux-клиент NovaNet для Linux/Android, совместимый с пр
 
 ## Что уже заложено
 
-- CLI для Termux: `vpn`, `socks`, `rawtun`-режимы.
+- CLI для Termux: VPN/SOCKS/raw-tun режимы через upstream WDTT engine.
 - Совместимый формат `wdtt://` / `qwdtt://`.
 - Профили и подписки через Supabase.
 - Edge API в Supabase для выдачи профилей без service-role ключа на клиенте.
@@ -33,7 +33,7 @@ Termux
        Postgres/RLS
 ```
 
-Оригинальный Android-клиент реализует WireGuard + TURN/VK транспорт, профили, SOCKS/raw-tun, captcha/VK account режимы и серверный WDTT. NovaNet переносит именно транспортный слой в Termux, а Android UI заменяет на CLI. Это сохраняет совместимость с `wdtt-server`.
+Оригинальный Android-клиент реализует WireGuard + TURN/VK транспорт, профили, SOCKS/raw-tun, captcha/VK account режимы и серверный WDTT. NovaNet переносит транспортный слой в Termux, а Android UI заменяет на CLI. Это сохраняет совместимость с `wdtt-server`.
 
 ## Установка в Termux
 
@@ -43,11 +43,11 @@ pkg install -y git curl wget golang wireguard-tools
 
 git clone https://github.com/sorashicompany/NovaNet.git
 cd NovaNet
-./scripts/bootstrap-upstream.sh
-./scripts/install-termux.sh
+bash ./scripts/bootstrap-upstream.sh
+bash ./scripts/install-termux.sh
 ```
 
-После bootstrap бинарь `novanet` будет собран из upstream WDTT Go engine с Termux-обвязкой.
+После bootstrap бинарь `novanet-engine` будет собран из закреплённого upstream WDTT Go engine, а `novanet` будет CLI-обвязкой.
 
 ## Конфигурация
 
@@ -69,7 +69,7 @@ novanet connect --profile NAME --mode socks --listen 127.0.0.1:1080
 
 ## Cloudflare
 
-Worker выполняет edge-кеширование подписки и передаёт запрос в Supabase Edge Function. Секреты задаются через Wrangler secrets, а не коммитятся в Git.
+Worker выполняет edge-кеширование подписки и передаёт запрос в Supabase Edge Function. Секреты задаются через Wrangler secrets, а не коммитятся в Git. Cache API используется только с хешем subscription token, чтобы сырой токен не попадал в cache key.
 
 ## Лицензия
 

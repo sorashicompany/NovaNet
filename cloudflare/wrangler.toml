@@ -1,0 +1,9 @@
+name = "novanet-subscription"
+main = "src/index.ts"
+compatibility_date = "2026-08-18"
+
+[vars]
+SUPABASE_FUNCTION_URL = "https://xvmcsqpfcabhblaweaix.supabase.co/functions/v1/novanet-subscription"
+
+[observability]
+enabled = true

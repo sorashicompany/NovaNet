@@ -1,16 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/novanet"
-PROFILES="$CONFIG_DIR/profiles"
-ENGINE="${NOVANET_ENGINE:-novanet-engine}"
-mkdir -p "$PROFILES"
-usage(){ echo 'Usage: novanet <wdtt://...> | novanet <qwdtt://...> | novanet --profile NAME'; }
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/novanet"; PROFILES="$CONFIG_DIR/profiles"; SETTINGS="$CONFIG_DIR/settings"; ENGINE="${NOVANET_ENGINE:-novanet-engine}"; mkdir -p "$PROFILES"
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
-name(){ printf '%s' "$1" | sha256sum | cut -c1-12; }
-import(){
-  local raw="$1" file; file="$PROFILES/$(name "$raw").env"
-  need python
-  python - "$raw" "$file" <<'PY'
+profile_name(){ printf '%s' "$1"|sha256sum|cut -c1-12; }
+import(){ local raw="$1" file; file="$PROFILES/$(profile_name "$raw").env"; need python; python - "$raw" "$file" <<'PY'
 import sys,urllib.parse
 r,f=sys.argv[1:]
 if r.startswith('wdtt://'):
@@ -18,29 +11,14 @@ if r.startswith('wdtt://'):
  if len(p)!=6: raise SystemExit('Invalid wdtt:// link')
  peer=f'{p[0]}:{p[1]}'; port=p[3]; password=p[4]; hashes=p[5]; workers='16'
 elif r.startswith(('qwdtt://','qwdtt:')):
- r=r.replace('qwdtt:config','qwdtt://config',1); q=urllib.parse.parse_qs(urllib.parse.urlparse(r).query)
- peer=q.get('peer',[''])[0]; port=q.get('port',['9000'])[0]; password=q.get('pass',q.get('password',['']))[0]; hashes=q.get('hashes',q.get('vkHashes',['']))[0]; workers=q.get('workers',['9'])[0]
+ r=r.replace('qwdtt:config','qwdtt://config',1); q=urllib.parse.parse_qs(urllib.parse.urlparse(r).query); peer=q.get('peer',[''])[0]; port=q.get('port',['9000'])[0]; password=q.get('pass',q.get('password',['']))[0]; hashes=q.get('hashes',q.get('vkHashes',['']))[0]; workers=q.get('workers',['9'])[0]
 else: raise SystemExit('Use wdtt:// or qwdtt://')
 if not peer or not password or not hashes: raise SystemExit('Invalid link')
 open(f,'w').write(f'PEER={peer}\nPORT={port}\nPASSWORD={password}\nHASHES={hashes}\nWORKERS={workers}\n')
 PY
- chmod 600 "$file"; printf '%s\n' "$file"
-}
-run(){
-  local link="$1" mode=socks listen=127.0.0.1:1080; shift
-  local extra=()
-  while [ $# -gt 0 ]; do case "$1" in --mode) mode="$2"; shift 2;; --listen) listen="$2"; shift 2;; --) shift; extra+=("$@"); break;; *) extra+=("$1"); shift;; esac; done
-  local file; file="$(import "$link")"; source "$file"
-  need "$ENGINE"
-  case "$mode" in
-    socks) exec "$ENGINE" -mode socks -socks "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS" "${extra[@]}";;
-    vpn) exec "$ENGINE" -mode vpn -listen "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS" "${extra[@]}";;
-    rawtun) exec "$ENGINE" -mode rawtun -listen "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS" "${extra[@]}";;
-    *) echo 'Mode: socks, vpn, rawtun' >&2; exit 2;;
-  esac
-}
-case "${1:-}" in
-  wdtt://*|qwdtt://*|qwdtt:*) run "$@";;
-  --profile) [ -n "${2:-}" ] || exit 2; file="$PROFILES/$2.env"; [ -f "$file" ] || { echo 'Profile not found' >&2; exit 1; }; source "$file"; need "$ENGINE"; exec "$ENGINE" -mode socks -socks 127.0.0.1:1080 -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS";;
-  *) usage; exit 2;;
-esac
+chmod 600 "$file"; echo "$file"; }
+run_file(){ local file="$1" mode="${2:-socks}" listen="${3:-127.0.0.1:1080}"; source "$file"; need "$ENGINE"; case "$mode" in socks) exec "$ENGINE" -mode socks -socks "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS";; vpn) exec "$ENGINE" -mode vpn -listen "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS";; rawtun) exec "$ENGINE" -mode rawtun -listen "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS";; esac; }
+profiles(){ local a=() f i=1; while IFS= read -r -d '' f; do a+=("$f"); printf '%d) %s\n' "$i" "$(basename "$f" .env)"; i=$((i+1)); done < <(find "$PROFILES" -maxdepth 1 -type f -name '*.env' -print0 2>/dev/null); ((${#a[@]})) || { echo 'Профилей нет.'; return 1; }; read -rp 'Выберите профиль: ' i; [[ "$i" =~ ^[0-9]+$ && i>0 && i<=${#a[@]} ]] || return 1; run_file "${a[i-1]}"; }
+settings(){ mkdir -p "$CONFIG_DIR"; local mode=${NOVANET_MODE:-socks} listen=${NOVANET_LISTEN:-127.0.0.1:1080}; echo; echo "1) Режим: $mode"; echo "2) Listen: $listen"; echo "3) Сохранить"; read -rp 'Выбор: ' n; case "$n" in 1) read -rp 'socks/vpn/rawtun: ' mode;; 2) read -rp '127.0.0.1:1080: ' listen;; 3) printf 'NOVANET_MODE=%q\nNOVANET_LISTEN=%q\n' "$mode" "$listen" >"$SETTINGS"; chmod 600 "$SETTINGS"; echo 'Сохранено.';; esac; }
+menu(){ while :; do clear; echo '=== NovaNet ==='; echo '1) Подключение'; echo '2) Добавить профиль'; echo '3) Настройки'; echo '4) Выход'; read -rp 'Выбор: ' n; case "$n" in 1) profiles || read -rp 'Enter...';; 2) read -rp 'wdtt:// или qwdtt://: ' l; import "$l"; read -rp 'Enter...';; 3) settings; read -rp 'Enter...';; 4) exit 0;; esac; done; }
+case "${1:-}" in wdtt://*|qwdtt://*|qwdtt:*) f="$(import "$1")"; run_file "$f";; --profile) f="$PROFILES/${2:?}.env"; [[ -f "$f" ]] || exit 1; run_file "$f";; --menu|'') menu;; --settings) settings;; *) echo 'novanet [wdtt://...] | --menu | --profile NAME | --settings'; exit 2;; esac

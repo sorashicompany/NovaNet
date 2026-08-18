@@ -2,139 +2,45 @@
 set -euo pipefail
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/novanet"
 PROFILES="$CONFIG_DIR/profiles"
+ENGINE="${NOVANET_ENGINE:-novanet-engine}"
 mkdir -p "$PROFILES"
-engine="${NOVANET_ENGINE:-novanet-engine}"
-usage(){ cat <<'EOF'
-NovaNet Termux
-
-  novanet run <wdtt://...|qwdtt://...> [--mode socks|vpn|rawtun] [--listen ADDR]
-  novanet profile import <wdtt://...|qwdtt://...|base64/json>
-  novanet profile list
-  novanet profile remove <name>
-  novanet connect --profile <name> [--mode socks|vpn|rawtun] [--listen ADDR]
-  novanet ping --profile <name>
-  novanet check --profile <name>
-  novanet subscription sync [URL]
-
-Extra engine options: novanet connect ... -- --turn-tcp --go-dns cloudflare
-EOF
-}
-require_cmd(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing $1. Install with: pkg install $2" >&2; exit 1; }; }
-profile_file(){ printf '%s/%s.json' "$PROFILES" "$1"; }
-valid_name(){ [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
-import_profile(){
-  local raw="${1:-}"; [ -n "$raw" ] || { echo 'profile value required' >&2; return 2; }
-  require_cmd python python
-  python - "$raw" "$PROFILES" <<'PY'
-import base64,json,os,sys,urllib.parse,tempfile
-raw,root=sys.argv[1],sys.argv[2]
-if raw.startswith('wdtt://'):
-    s=raw[7:].split('#',1); name=s[1] if len(s)==2 and s[1] else ''
-    p=s[0].split(':')
-    if len(p)<6: raise SystemExit('invalid wdtt://: expected IP:DTLS_PORT:WG_PORT:LOCAL_PORT:PASSWORD:HASH')
-    peer=f'{p[0]}:{p[1]}'
-    obj={'name':name or f'NovaNet-{p[0].replace(".","-")}', 'peer':peer, 'dtls_port':int(p[1]), 'wg_port':int(p[2]), 'port':int(p[3]), 'password':p[4], 'hashes':':'.join(p[5:]), 'workers':16, 'source':raw}
-elif raw.startswith(('qwdtt://','qwdtt:')):
-    if raw.startswith('qwdtt:config'): raw=raw.replace('qwdtt:config','qwdtt://config',1)
-    u=urllib.parse.urlparse(raw); q=urllib.parse.parse_qs(u.query)
-    obj={'name':q.get('name',['NovaNet'])[0],'peer':q.get('peer',[''])[0],'port':int(q.get('port',['9000'])[0]),'password':q.get('pass',q.get('password',['']))[0],'hashes':q.get('hashes',q.get('vkHashes',['']))[0],'workers':int(q.get('workers',['9'])[0]),'source':raw}
-else:
-    text=raw.strip()
-    try: obj=json.loads(text)
-    except Exception:
-        try: obj=json.loads(base64.b64decode(text+'='*((4-len(text)%4)%4)).decode())
-        except Exception as e: raise SystemExit('profile must be JSON, base64 JSON, wdtt:// or qwdtt://') from e
-if not obj.get('peer') or not obj.get('password') or not obj.get('hashes'): raise SystemExit('peer/password/hashes are required')
-name=''.join(c if c.isalnum() or c in '._-' else '_' for c in str(obj.get('name','profile'))).strip('_') or 'profile'
-obj['name']=name
-os.makedirs(root,exist_ok=True); fd,tmp=tempfile.mkstemp(prefix='.profile-',suffix='.tmp',dir=root); os.close(fd)
-try:
-    with open(tmp,'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2); f.write('\n')
-    os.chmod(tmp,0o600); os.replace(tmp,os.path.join(root,name+'.json'))
-finally:
-    if os.path.exists(tmp): os.unlink(tmp)
-print(name)
+usage(){ echo 'Usage: novanet <wdtt://...> | novanet <qwdtt://...> | novanet --profile NAME'; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
+name(){ printf '%s' "$1" | sha256sum | cut -c1-12; }
+import(){
+  local raw="$1" file; file="$PROFILES/$(name "$raw").env"
+  need python
+  python - "$raw" "$file" <<'PY'
+import sys,urllib.parse
+r,f=sys.argv[1:]
+if r.startswith('wdtt://'):
+ p=r[7:].split(':',5)
+ if len(p)!=6: raise SystemExit('Invalid wdtt:// link')
+ peer=f'{p[0]}:{p[1]}'; port=p[3]; password=p[4]; hashes=p[5]; workers='16'
+elif r.startswith(('qwdtt://','qwdtt:')):
+ r=r.replace('qwdtt:config','qwdtt://config',1); q=urllib.parse.parse_qs(urllib.parse.urlparse(r).query)
+ peer=q.get('peer',[''])[0]; port=q.get('port',['9000'])[0]; password=q.get('pass',q.get('password',['']))[0]; hashes=q.get('hashes',q.get('vkHashes',['']))[0]; workers=q.get('workers',['9'])[0]
+else: raise SystemExit('Use wdtt:// or qwdtt://')
+if not peer or not password or not hashes: raise SystemExit('Invalid link')
+open(f,'w').write(f'PEER={peer}\nPORT={port}\nPASSWORD={password}\nHASHES={hashes}\nWORKERS={workers}\n')
 PY
+ chmod 600 "$file"; printf '%s\n' "$file"
 }
-get_profile(){
-  local file; file="$(profile_file "$1")"; [ -f "$file" ] || { echo "profile not found: $1" >&2; exit 2; }
-  require_cmd python python
-  python - "$file" <<'PY'
-import json,sys
-p=json.load(open(sys.argv[1],encoding='utf-8'))
-for k in ('peer','hashes','password'):
-    if not p.get(k): raise SystemExit('profile missing '+k)
-print(p['peer'],p['hashes'],int(p.get('workers',9)),int(p.get('port',9000)),p['password'])
-PY
-}
-run_link(){
-  local raw="${1:-}" mode="socks" listen="127.0.0.1:1080"; shift || true; local extra=()
-  [ -n "$raw" ] || { echo 'wdtt/qwdtt link required' >&2; exit 2; }
-  while [ $# -gt 0 ]; do case "$1" in --mode) mode="${2:?}"; shift 2;; --listen) listen="${2:?}"; shift 2;; --) shift; extra+=("$@"); break;; *) extra+=("$1"); shift;; esac; done
-  local name; name="$(import_profile "$raw")"
-  exec connect_profile "$name" "$mode" "$listen" "${extra[@]}"
-}
-connect_profile(){
-  local profile="$1" mode="$2" listen="$3"; shift 3; local extra=("$@")
-  command -v "$engine" >/dev/null 2>&1 || { echo "Engine not found: $engine. Run install-termux.sh" >&2; exit 1; }
-  read -r peer hashes workers port pass < <(get_profile "$profile")
+run(){
+  local link="$1" mode=socks listen=127.0.0.1:1080; shift
+  local extra=()
+  while [ $# -gt 0 ]; do case "$1" in --mode) mode="$2"; shift 2;; --listen) listen="$2"; shift 2;; --) shift; extra+=("$@"); break;; *) extra+=("$1"); shift;; esac; done
+  local file; file="$(import "$link")"; source "$file"
+  need "$ENGINE"
   case "$mode" in
-    socks) exec "$engine" -mode socks -socks "$listen" -peer "$peer" -vk "$hashes" -password "$pass" -n "$workers" "${extra[@]}";;
-    vpn) exec "$engine" -mode vpn -listen "$listen" -peer "$peer" -vk "$hashes" -password "$pass" -n "$workers" "${extra[@]}";;
-    rawtun) exec "$engine" -mode rawtun -listen "$listen" -peer "$peer" -vk "$hashes" -password "$pass" -n "$workers" "${extra[@]}";;
-    *) echo 'mode must be socks, vpn or rawtun' >&2; exit 2;;
+    socks) exec "$ENGINE" -mode socks -socks "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS" "${extra[@]}";;
+    vpn) exec "$ENGINE" -mode vpn -listen "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS" "${extra[@]}";;
+    rawtun) exec "$ENGINE" -mode rawtun -listen "$listen" -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS" "${extra[@]}";;
+    *) echo 'Mode: socks, vpn, rawtun' >&2; exit 2;;
   esac
 }
 case "${1:-}" in
-run) shift; run_link "$@";;
-profile)
-  case "${2:-}" in
-    import) import_profile "${3:-}";;
-    list) for f in "$PROFILES"/*.json; do [ -f "$f" ] || continue; [ "$(basename "$f")" = subscription.json ] && continue; basename "$f" .json; done | sort;;
-    remove) [ -n "${3:-}" ] && valid_name "$3" || { echo 'invalid profile name' >&2; exit 2; }; rm -f "$(profile_file "$3")";;
-    *) usage; exit 2;;
-  esac;;
-connect|ping|check)
-  action="$1"; shift; profile=""; mode="socks"; listen="127.0.0.1:1080"; extra=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --profile) profile="${2:?}"; shift 2;;
-      --mode) mode="${2:?}"; shift 2;;
-      --listen) listen="${2:?}"; shift 2;;
-      --) shift; extra+=("$@"); break;;
-      *) extra+=("$1"); shift;;
-    esac
-  done
-  [ -n "$profile" ] || { echo '--profile is required' >&2; exit 2; }
-  case "$action" in
-    ping) command -v "$engine" >/dev/null 2>&1 || exit 1; read -r peer hashes workers port pass < <(get_profile "$profile"); exec "$engine" -peer "$peer" -vk "$hashes" -password "$pass" -ping-only "${extra[@]}";;
-    check) command -v "$engine" >/dev/null 2>&1 || exit 1; read -r peer hashes workers port pass < <(get_profile "$profile"); exec "$engine" -vk "$hashes" -check-hashes "${extra[@]}";;
-    connect) connect_profile "$profile" "$mode" "$listen" "${extra[@]}";;
-  esac;;
-subscription)
-  [ "${2:-}" = sync ] || { usage; exit 2; }; require_cmd curl curl; require_cmd python python
-  url="${3:-${NOVANET_SUBSCRIPTION_URL:-}}"; [ -n "$url" ] || { echo 'subscription URL required' >&2; exit 2; }
-  tmp="$PROFILES/.subscription.$$.tmp"; trap 'rm -f "$tmp"' EXIT
-  curl --fail --silent --show-error --location --connect-timeout 10 --max-time 45 --retry 3 --retry-delay 2 --retry-all-errors -A 'NovaNet-Termux/1.0' "$url" -o "$tmp"
-  python - "$tmp" "$PROFILES" <<'PY'
-import base64,json,sys,os,tempfile
-raw=open(sys.argv[1],encoding='utf-8').read().strip()
-try: src=json.loads(raw)
-except Exception: src=json.loads(base64.b64decode(raw+'='*((4-len(raw)%4)%4)).decode())
-profiles=src if isinstance(src,list) else src.get('profiles',src.get('servers',[]))
-if not profiles: raise SystemExit('subscription contains no profiles')
-root=sys.argv[2]; names=set()
-for p in profiles:
- n=''.join(c if c.isalnum() or c in '._-' else '_' for c in p.get('name','server')).strip('_') or 'server'; base=n; i=2
- while n in names: n=f'{base}-{i}'; i+=1
- names.add(n); p=dict(p); p['name']=n; fd,tmp=tempfile.mkstemp(prefix='.sync-',suffix='.json',dir=root); os.close(fd)
- try:
-  with open(tmp,'w',encoding='utf-8') as f: json.dump(p,f,ensure_ascii=False,indent=2); f.write('\n')
-  os.chmod(tmp,0o600); os.replace(tmp,os.path.join(root,n+'.json'))
- finally:
-  if os.path.exists(tmp): os.unlink(tmp)
-print('synced',len(names),'profiles')
-PY
-  ;;
-*) usage; exit 2;;
+  wdtt://*|qwdtt://*|qwdtt:*) run "$@";;
+  --profile) [ -n "${2:-}" ] || exit 2; file="$PROFILES/$2.env"; [ -f "$file" ] || { echo 'Profile not found' >&2; exit 1; }; source "$file"; need "$ENGINE"; exec "$ENGINE" -mode socks -socks 127.0.0.1:1080 -peer "$PEER" -vk "$HASHES" -password "$PASSWORD" -n "$WORKERS";;
+  *) usage; exit 2;;
 esac
